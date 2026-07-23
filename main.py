@@ -680,19 +680,19 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "default": GeneralLlm(
-                model="openrouter/meta-llama/llama-3.3-70b-instruct:free",
+                model="groq/llama-3.3-70b-versatile",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
             ),
             "summarizer": GeneralLlm(
-                model="openrouter/meta-llama/llama-3.3-70b-instruct:free",
+                model="groq/llama-3.3-70b-versatile",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
             ),
             "parser": GeneralLlm(
-                model="openrouter/meta-llama/llama-3.3-70b-instruct:free",
+                model="groq/llama-3.3-70b-versatile",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
