@@ -697,6 +697,12 @@ if __name__ == "__main__":
                 timeout=60,
                 allowed_tries=2,
             ),
+            "researcher": GeneralLlm(
+                model="groq/llama-3.3-70b-versatile",
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            ),
         },
     )
 
