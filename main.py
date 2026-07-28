@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import statistics
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -47,95 +49,78 @@ logger = logging.getLogger(__name__)
 
 class SummerTemplateBot2026(ForecastBot):
     """
-    This is the template bot for Summer 2026 Metaculus AI Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
+    Ensemble bot for Summer 2026 Metaculus AI Tournament.
 
-    Main changes since Fall:
-    - Additional prompting has been added to numeric questions to emphasize putting pecentile values in the correct order.
-    - Support for conditional and date questions has been added
-    - Note: Summer AIB will not use date/conditional questions, so these are only for forecasting on the main site as you wish.
+    Improvements over the single-model template:
+    - Multi-model ensemble: runs Groq llama-3.3-70b + Groq gemma2-9b in parallel,
+      adding OpenRouter and/or Anthropic if those API keys are configured. Each
+      model's predictions are aggregated (arithmetic mean for binary, percentile
+      averaging for numeric/date, probability averaging for multiple-choice). A
+      model that errors is skipped gracefully — the others continue.
+    - Adaptive researcher: uses AskNews (real-time news) when ASKNEWS_CLIENT_ID +
+      ASKNEWS_SECRET are set, SmartSearcher (web) when EXA_API_KEY or
+      PERPLEXITY_API_KEY are set, and falls back to Groq LLM knowledge otherwise.
 
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    Pending credentials (add as GitHub Secrets to unlock further improvements):
+    - ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → real-time news research
+      Signup: https://my.asknews.app (Free Tier)
+    - ANTHROPIC_API_KEY → adds Claude Haiku 4.5 to ensemble (best reasoning)
+    - EXA_API_KEY or PERPLEXITY_API_KEY → enables SmartSearcher web research
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    # Primary Groq models (always available with GROQ_API_KEY).
+    _GROQ_PRIMARY = "groq/llama-3.3-70b-versatile"
+    _GROQ_SECONDARY = "groq/gemma2-9b-it"
+    # OpenRouter free-tier model (no billing needed; used when key is set).
+    _OPENROUTER_FREE = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+    # Anthropic model (used when ANTHROPIC_API_KEY is set).
+    _ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
+
+    def _get_ensemble_models(self) -> list[GeneralLlm]:
+        """Return list of LLMs for ensemble based on available env vars."""
+        models: list[GeneralLlm] = [
+            GeneralLlm(
+                model=self._GROQ_PRIMARY,
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            ),
+            GeneralLlm(
+                model=self._GROQ_SECONDARY,
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            ),
+        ]
+        if os.getenv("OPENROUTER_API_KEY"):
+            # allowed_tries=1 so a rate-limited free model fails fast.
+            models.append(
+                GeneralLlm(
+                    model=self._OPENROUTER_FREE,
+                    temperature=0.3,
+                    timeout=60,
+                    allowed_tries=1,
+                )
+            )
+        if os.getenv("ANTHROPIC_API_KEY"):
+            models.append(
+                GeneralLlm(
+                    model=self._ANTHROPIC_MODEL,
+                    temperature=0.3,
+                    timeout=60,
+                    allowed_tries=2,
+                )
+            )
+        return models
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
             prompt = clean_indents(
                 f"""
                 You are an assistant to a superforecaster.
@@ -153,32 +138,42 @@ class SummerTemplateBot2026(ForecastBot):
                 """
             )
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+            # Priority 1: AskNews — real-time news search (best for current events).
+            if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"):
+                try:
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        "asknews/news-summaries", prompt
+                    )
+                    logger.info(f"AskNews research for {question.page_url}: done")
+                    return research
+                except Exception as e:
+                    logger.warning(f"AskNews failed, falling through: {e}")
+
+            # Priority 2: SmartSearcher — web search with LLM synthesis.
+            if os.getenv("EXA_API_KEY") or os.getenv("PERPLEXITY_API_KEY"):
+                try:
+                    searcher = SmartSearcher(
+                        model=self._GROQ_PRIMARY,
+                        temperature=0,
+                        num_searches_to_run=2,
+                        num_sites_per_search=10,
+                        use_advanced_filters=False,
+                    )
+                    research = await searcher.invoke(prompt)
+                    logger.info(f"SmartSearcher research for {question.page_url}: done")
+                    return research
+                except Exception as e:
+                    logger.warning(f"SmartSearcher failed, falling through: {e}")
+
+            # Fallback: Groq LLM knowledge only (no live web access).
+            researcher_llm = GeneralLlm(
+                model=self._GROQ_PRIMARY,
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            )
+            research = await researcher_llm.invoke(prompt)
+            logger.info(f"LLM-only research for {question.page_url}: done")
             return research
 
     ##################################### BINARY QUESTIONS #####################################
@@ -228,20 +223,44 @@ class SummerTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        ensemble_models = self._get_ensemble_models()
+        probabilities: list[float] = []
+        reasonings: list[str] = []
+
+        for llm in ensemble_models:
+            try:
+                reasoning = await llm.invoke(prompt)
+                binary_prediction: BinaryPrediction = await structure_output(
+                    reasoning,
+                    BinaryPrediction,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+                probabilities.append(p)
+                reasonings.append(f"### [{llm.model}]\n{reasoning}")
+            except Exception as e:
+                logger.warning(
+                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                )
+
+        if not probabilities:
+            raise RuntimeError(
+                f"All ensemble models failed for {question.page_url}"
+            )
+
+        # Arithmetic mean across models. Geometric mean of log-odds is theoretically
+        # superior but adds complexity without decisive empirical benefit at this scale.
+        final_prob = max(0.01, min(0.99, statistics.mean(probabilities)))
 
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
+            f"Ensemble binary [{question.page_url}]: "
+            f"{[f'{p:.3f}' for p in probabilities]} → {final_prob:.3f}"
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=final_prob,
+            reasoning="\n\n---\n\n".join(reasonings),
+        )
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
@@ -302,21 +321,62 @@ class SummerTemplateBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
+
+        ensemble_models = self._get_ensemble_models()
+        all_option_probs: list[dict[str, float]] = []
+        reasonings: list[str] = []
+
+        for llm in ensemble_models:
+            try:
+                reasoning = await llm.invoke(prompt)
+                predicted_option_list: PredictedOptionList = await structure_output(
+                    text_to_structure=reasoning,
+                    output_type=PredictedOptionList,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                    additional_instructions=parsing_instructions,
+                )
+                option_probs = {
+                    opt.option_name: opt.probability
+                    for opt in predicted_option_list.predicted_options
+                }
+                all_option_probs.append(option_probs)
+                reasonings.append(f"### [{llm.model}]\n{reasoning}")
+            except Exception as e:
+                logger.warning(
+                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                )
+
+        if not all_option_probs:
+            raise RuntimeError(
+                f"All ensemble models failed for {question.page_url}"
+            )
+
+        # Average each option's probability across all models, then renormalize.
+        avg_probs: dict[str, float] = {}
+        for option in question.options:
+            values = [d.get(option, 0.0) for d in all_option_probs]
+            avg_probs[option] = statistics.mean(values)
+
+        total = sum(avg_probs.values()) or 1.0
+        normalized = {k: v / total for k, v in avg_probs.items()}
+
+        # Re-parse the averaged probabilities into the required PredictedOptionList type.
+        averaged_text = "\n".join(
+            f"{opt}: {prob:.4f}" for opt, prob in normalized.items()
+        )
+        final_option_list: PredictedOptionList = await structure_output(
+            text_to_structure=averaged_text,
             output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
+            num_validation_samples=1,
             additional_instructions=parsing_instructions,
         )
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
-        )
+        logger.info(f"Ensemble MC [{question.page_url}]: {normalized}")
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=final_option_list,
+            reasoning="\n\n---\n\n".join(reasonings),
         )
 
     ##################################### NUMERIC QUESTIONS #####################################
@@ -385,8 +445,6 @@ class SummerTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a numeric question.
@@ -400,18 +458,54 @@ class SummerTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        prediction = NumericDistribution.from_question(percentile_list, question)
+
+        ensemble_models = self._get_ensemble_models()
+        all_percentile_lists: list[list[Percentile]] = []
+        reasonings: list[str] = []
+
+        for llm in ensemble_models:
+            try:
+                reasoning = await llm.invoke(prompt)
+                percentile_list: list[Percentile] = await structure_output(
+                    reasoning,
+                    list[Percentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                if percentile_list:
+                    all_percentile_lists.append(percentile_list)
+                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
+            except Exception as e:
+                logger.warning(
+                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                )
+
+        if not all_percentile_lists:
+            raise RuntimeError(
+                f"All ensemble models failed for {question.page_url}"
+            )
+
+        # Average percentile values across models, matching on percentile number.
+        percentile_buckets: dict[float, list[float]] = {}
+        for plist in all_percentile_lists:
+            for p in plist:
+                percentile_buckets.setdefault(p.percentile, []).append(p.value)
+
+        averaged_percentiles = [
+            Percentile(percentile=pct, value=statistics.mean(vals))
+            for pct, vals in sorted(percentile_buckets.items())
+        ]
+
+        prediction = NumericDistribution.from_question(averaged_percentiles, question)
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+            f"Ensemble numeric [{question.page_url}]: "
+            f"{[(p.percentile, round(p.value, 3)) for p in averaged_percentiles]}"
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction,
+            reasoning="\n\n---\n\n".join(reasonings),
+        )
 
     ##################################### DATE QUESTIONS #####################################
 
@@ -471,16 +565,13 @@ class SummerTemplateBot2026(ForecastBot):
             "
             """
         )
-        forecast = await self._date_prompt_to_forecast(question, prompt)
-        return forecast
+        return await self._date_prompt_to_forecast(question, prompt)
 
     async def _date_prompt_to_forecast(
         self,
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a date question.
@@ -490,26 +581,62 @@ class SummerTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
 
-        percentile_list = [
-            Percentile(
-                percentile=percentile.percentile,
-                value=percentile.value.timestamp(),
+        ensemble_models = self._get_ensemble_models()
+        all_percentile_lists: list[list[Percentile]] = []
+        reasonings: list[str] = []
+
+        for llm in ensemble_models:
+            try:
+                reasoning = await llm.invoke(prompt)
+                date_percentile_list: list[DatePercentile] = await structure_output(
+                    reasoning,
+                    list[DatePercentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                if date_percentile_list:
+                    # Convert datetime → Unix timestamp for numeric averaging.
+                    as_timestamps = [
+                        Percentile(
+                            percentile=dp.percentile,
+                            value=dp.value.timestamp(),
+                        )
+                        for dp in date_percentile_list
+                    ]
+                    all_percentile_lists.append(as_timestamps)
+                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
+            except Exception as e:
+                logger.warning(
+                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                )
+
+        if not all_percentile_lists:
+            raise RuntimeError(
+                f"All ensemble models failed for {question.page_url}"
             )
-            for percentile in date_percentile_list
+
+        # Average timestamp values per percentile bucket.
+        percentile_buckets: dict[float, list[float]] = {}
+        for plist in all_percentile_lists:
+            for p in plist:
+                percentile_buckets.setdefault(p.percentile, []).append(p.value)
+
+        averaged_percentiles = [
+            Percentile(percentile=pct, value=statistics.mean(vals))
+            for pct, vals in sorted(percentile_buckets.items())
         ]
-        prediction = NumericDistribution.from_question(percentile_list, question)
+
+        prediction = NumericDistribution.from_question(averaged_percentiles, question)
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+            f"Ensemble date [{question.page_url}]: "
+            f"{[(p.percentile, p.value) for p in averaged_percentiles]}"
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction,
+            reasoning="\n\n---\n\n".join(reasonings),
+        )
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -592,7 +719,6 @@ class SummerTemplateBot2026(ForecastBot):
             and previous_forecasts
             and question_type not in self.force_reforecast_in_conditional
         ):
-            # TODO: add option to not affirm current parent/child forecasts, create new forecast
             previous_forecast = previous_forecasts[-1]
             current_utc_time = datetime.now(timezone.utc)
             if (
@@ -667,9 +793,20 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # The bot now runs ensemble forecasting internally — models are selected
+    # dynamically in _get_ensemble_models() based on available API keys:
+    #   GROQ_API_KEY (required): llama-3.3-70b-versatile + gemma2-9b-it
+    #   OPENROUTER_API_KEY (optional): adds llama-3.3-70b-instruct:free
+    #   ANTHROPIC_API_KEY (optional): adds claude-haiku-4-5
+    #
+    # Research strategy (first available wins):
+    #   ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → AskNews real-time news
+    #   EXA_API_KEY or PERPLEXITY_API_KEY  → SmartSearcher web search
+    #   (neither set)                       → Groq LLM knowledge only
+    #
+    # The llms= dict below only affects roles not overridden in the class
+    # (parser, summarizer). Forecasting and research are handled by the
+    # overridden methods above.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -706,18 +843,12 @@ if __name__ == "__main__":
         },
     )
 
-    # Per-mode tournament URL shown in the summary banner footer. These
-    # piggyback on the forecasting_tools SDK constants and need updating
-    # whenever those rotate seasons.
     TOURNAMENT_URLS = {
         "tournament": "https://www.metaculus.com/tournament/summer-futureeval-2026/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
 
-    # Dispatch on mode. Each branch produces a list of ForecastReport (or
-    # exceptions, since return_exceptions=True) which then flows into the
-    # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
@@ -732,9 +863,6 @@ if __name__ == "__main__":
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
-        # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
         template_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
@@ -742,9 +870,6 @@ if __name__ == "__main__":
             )
         )
     elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
         template_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
