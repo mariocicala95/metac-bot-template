@@ -52,11 +52,12 @@ class SummerTemplateBot2026(ForecastBot):
     Ensemble bot for Summer 2026 Metaculus AI Tournament.
 
     Improvements over the single-model template:
-    - Multi-model ensemble: runs Groq llama-3.3-70b + Groq gemma2-9b in parallel,
-      adding OpenRouter and/or Anthropic if those API keys are configured. Each
-      model's predictions are aggregated (arithmetic mean for binary, percentile
-      averaging for numeric/date, probability averaging for multiple-choice). A
-      model that errors is skipped gracefully — the others continue.
+    - Multi-model ensemble: runs Groq llama-3.3-70b-versatile + Groq
+      llama-3.1-8b-instant (separate TPM pools → no cross-model rate limiting),
+      adding Anthropic Claude Haiku if ANTHROPIC_API_KEY is set. Each model's
+      predictions are aggregated (arithmetic mean for binary, percentile averaging
+      for numeric/date, probability averaging for multiple-choice). A model that
+      errors is skipped gracefully — the others continue.
     - Adaptive researcher: uses AskNews (real-time news) when ASKNEWS_CLIENT_ID +
       ASKNEWS_SECRET are set, SmartSearcher (web) when EXA_API_KEY or
       PERPLEXITY_API_KEY are set, and falls back to Groq LLM knowledge otherwise.
@@ -72,11 +73,10 @@ class SummerTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    # Primary Groq models (always available with GROQ_API_KEY).
+    # Primary Groq model: best quality, 12k TPM on free tier.
     _GROQ_PRIMARY = "groq/llama-3.3-70b-versatile"
-    _GROQ_SECONDARY = "groq/gemma2-9b-it"
-    # OpenRouter free-tier model (no billing needed; used when key is set).
-    _OPENROUTER_FREE = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+    # Secondary Groq model: faster + separate TPM pool → no cross-model rate racing.
+    _GROQ_SECONDARY = "groq/llama-3.1-8b-instant"
     # Anthropic model (used when ANTHROPIC_API_KEY is set).
     _ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
 
@@ -96,16 +96,6 @@ class SummerTemplateBot2026(ForecastBot):
                 allowed_tries=2,
             ),
         ]
-        if os.getenv("OPENROUTER_API_KEY"):
-            # allowed_tries=1 so a rate-limited free model fails fast.
-            models.append(
-                GeneralLlm(
-                    model=self._OPENROUTER_FREE,
-                    temperature=0.3,
-                    timeout=60,
-                    allowed_tries=1,
-                )
-            )
         if os.getenv("ANTHROPIC_API_KEY"):
             models.append(
                 GeneralLlm(
@@ -826,20 +816,19 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # The bot now runs ensemble forecasting internally — models are selected
-    # dynamically in _get_ensemble_models() based on available API keys:
-    #   GROQ_API_KEY (required): llama-3.3-70b-versatile + gemma2-9b-it
-    #   OPENROUTER_API_KEY (optional): adds llama-3.3-70b-instruct:free
-    #   ANTHROPIC_API_KEY (optional): adds claude-haiku-4-5
+    # Ensemble and research are handled by overridden methods in the class.
+    # The llms= dict here only configures the parser and summarizer roles,
+    # which are NOT overridden and run on the lighter 8b model to keep
+    # llama-3.3-70b TPM free for actual forecasting.
+    #
+    # Ensemble models (selected dynamically in _get_ensemble_models):
+    #   GROQ_API_KEY (required): llama-3.3-70b-versatile + llama-3.1-8b-instant
+    #   ANTHROPIC_API_KEY (optional): adds claude-haiku-4-5-20251001
     #
     # Research strategy (first available wins):
     #   ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → AskNews real-time news
     #   EXA_API_KEY or PERPLEXITY_API_KEY  → SmartSearcher web search
     #   (neither set)                       → Groq LLM knowledge only
-    #
-    # The llms= dict below only affects roles not overridden in the class
-    # (parser, summarizer). Forecasting and research are handled by the
-    # overridden methods above.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -849,20 +838,23 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
+            # default is bypassed by ensemble overrides but kept as fallback.
             "default": GeneralLlm(
                 model="groq/llama-3.3-70b-versatile",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
             ),
+            # parser and summarizer use the 8b model: parsing/summarizing don't
+            # need the 70b and using 8b preserves the 70b's 12k TPM for forecasting.
             "summarizer": GeneralLlm(
-                model="groq/llama-3.3-70b-versatile",
+                model="groq/llama-3.1-8b-instant",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
             ),
             "parser": GeneralLlm(
-                model="groq/llama-3.3-70b-versatile",
+                model="groq/llama-3.1-8b-instant",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
