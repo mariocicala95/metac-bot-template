@@ -336,10 +336,32 @@ class SummerTemplateBot2026(ForecastBot):
                     num_validation_samples=self._structure_output_validation_samples,
                     additional_instructions=parsing_instructions,
                 )
-                option_probs = {
-                    opt.option_name: opt.probability
-                    for opt in predicted_option_list.predicted_options
-                }
+                # PredictedOptionList internals vary across forecasting-tools versions;
+                # try multiple attribute naming conventions before giving up.
+                option_probs: dict[str, float] = {}
+                _items = (
+                    getattr(predicted_option_list, "predicted_options", None)
+                    or getattr(predicted_option_list, "options", None)
+                    or getattr(predicted_option_list, "prediction", None)
+                )
+                if _items is None:
+                    try:
+                        _items = list(predicted_option_list)
+                    except TypeError:
+                        _items = []
+                for _item in (_items or []):
+                    _name = (
+                        getattr(_item, "option_name", None)
+                        or getattr(_item, "option", None)
+                        or getattr(_item, "name", None)
+                    )
+                    _prob = getattr(_item, "probability", None)
+                    if _name and _prob is not None:
+                        option_probs[_name] = float(_prob)
+                if not option_probs:
+                    raise AttributeError(
+                        f"Could not extract options from {type(predicted_option_list)}"
+                    )
                 all_option_probs.append(option_probs)
                 reasonings.append(f"### [{llm.model}]\n{reasoning}")
             except Exception as e:
@@ -348,9 +370,20 @@ class SummerTemplateBot2026(ForecastBot):
                 )
 
         if not all_option_probs:
-            raise RuntimeError(
-                f"All ensemble models failed for {question.page_url}"
+            # Fallback: single-model original path (avoids dropping MC questions entirely).
+            logger.warning(
+                f"MC ensemble fully failed for {question.page_url}; "
+                f"using single-model fallback (check PredictedOptionList attributes)"
             )
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
+            fallback_list: PredictedOptionList = await structure_output(
+                text_to_structure=reasoning,
+                output_type=PredictedOptionList,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=parsing_instructions,
+            )
+            return ReasonedPrediction(prediction_value=fallback_list, reasoning=reasoning)
 
         # Average each option's probability across all models, then renormalize.
         avg_probs: dict[str, float] = {}
