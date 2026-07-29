@@ -156,8 +156,10 @@ class SummerTemplateBot2026(ForecastBot):
                     logger.warning(f"SmartSearcher failed, falling through: {e}")
 
             # Fallback: Groq LLM knowledge only (no live web access).
+            # Use the fast secondary model here so the 70b's 12k TPM stays
+            # available for the ensemble forecasting calls.
             researcher_llm = GeneralLlm(
-                model=self._GROQ_PRIMARY,
+                model=self._GROQ_SECONDARY,
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
@@ -860,7 +862,7 @@ if __name__ == "__main__":
                 allowed_tries=2,
             ),
             "researcher": GeneralLlm(
-                model="groq/llama-3.3-70b-versatile",
+                model="groq/llama-3.1-8b-instant",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
