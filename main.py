@@ -53,14 +53,16 @@ class SummerTemplateBot2026(ForecastBot):
 
     Improvements over the single-model template:
     - Multi-model ensemble: runs Groq llama-3.3-70b-versatile + Groq
-      llama-3.1-8b-instant (separate TPM pools → no cross-model rate limiting),
-      adding Anthropic Claude Haiku if ANTHROPIC_API_KEY is set. Each model's
-      predictions are aggregated (arithmetic mean for binary, percentile averaging
-      for numeric/date, probability averaging for multiple-choice). A model that
-      errors is skipped gracefully — the others continue.
+      llama-3.1-8b-instant. Each model's predictions are aggregated (arithmetic
+      mean for binary, percentile averaging for numeric/date, probability
+      averaging for multiple-choice). A model that errors is skipped; if ALL
+      models fail, the primary is retried alone with higher allowed_tries.
     - Adaptive researcher: uses AskNews (real-time news) when ASKNEWS_CLIENT_ID +
       ASKNEWS_SECRET are set, SmartSearcher (web) when EXA_API_KEY or
       PERPLEXITY_API_KEY are set, and falls back to Groq LLM knowledge otherwise.
+    - Concurrency control: _concurrency_limiter applied to both research AND each
+      forecast method, fully serialising question processing to stay within free-tier
+      TPM limits on both Groq models.
 
     Pending credentials (add as GitHub Secrets to unlock further improvements):
     - ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → real-time news research
@@ -71,11 +73,13 @@ class SummerTemplateBot2026(ForecastBot):
 
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    # 1 sample is enough: halves parser calls vs. the default 2, which matters
+    # because Groq free-tier TPM limits are low (6–12k/min per model).
+    _structure_output_validation_samples = 1
 
     # Primary Groq model: best quality, 12k TPM on free tier.
     _GROQ_PRIMARY = "groq/llama-3.3-70b-versatile"
-    # Secondary Groq model: faster + separate TPM pool → no cross-model rate racing.
+    # Secondary Groq model: fast, separate TPM pool (6k TPM free tier).
     _GROQ_SECONDARY = "groq/llama-3.1-8b-instant"
     # Anthropic model (used when ANTHROPIC_API_KEY is set).
     _ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
@@ -106,6 +110,15 @@ class SummerTemplateBot2026(ForecastBot):
                 )
             )
         return models
+
+    def _primary_llm(self, timeout: int = 120, allowed_tries: int = 4) -> GeneralLlm:
+        """High-retry primary LLM for last-resort fallback."""
+        return GeneralLlm(
+            model=self._GROQ_PRIMARY,
+            temperature=0.3,
+            timeout=timeout,
+            allowed_tries=allowed_tries,
+        )
 
     ##################################### RESEARCH #####################################
 
@@ -156,15 +169,7 @@ class SummerTemplateBot2026(ForecastBot):
                     logger.warning(f"SmartSearcher failed, falling through: {e}")
 
             # Fallback: Groq LLM knowledge only (no live web access).
-            # Use the fast secondary model here so the 70b's 12k TPM stays
-            # available for the ensemble forecasting calls.
-            researcher_llm = GeneralLlm(
-                model=self._GROQ_SECONDARY,
-                temperature=0.3,
-                timeout=60,
-                allowed_tries=2,
-            )
-            research = await researcher_llm.invoke(prompt)
+            research = await self._primary_llm().invoke(prompt)
             logger.info(f"LLM-only research for {question.page_url}: done")
             return research
 
@@ -215,44 +220,54 @@ class SummerTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        ensemble_models = self._get_ensemble_models()
-        probabilities: list[float] = []
-        reasonings: list[str] = []
+        async with self._concurrency_limiter:
+            ensemble_models = self._get_ensemble_models()
+            probabilities: list[float] = []
+            reasonings: list[str] = []
 
-        for llm in ensemble_models:
-            try:
-                reasoning = await llm.invoke(prompt)
-                binary_prediction: BinaryPrediction = await structure_output(
+            for llm in ensemble_models:
+                try:
+                    reasoning = await llm.invoke(prompt)
+                    binary_prediction: BinaryPrediction = await structure_output(
+                        reasoning,
+                        BinaryPrediction,
+                        model=self.get_llm("parser", "llm"),
+                        num_validation_samples=self._structure_output_validation_samples,
+                    )
+                    p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+                    probabilities.append(p)
+                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
+                except Exception as e:
+                    logger.warning(
+                        f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                    )
+
+            if not probabilities:
+                # All ensemble models failed — retry with primary alone at higher persistence.
+                logger.warning(
+                    f"All ensemble models failed for {question.page_url}; "
+                    f"retrying with primary model (allowed_tries=4)."
+                )
+                reasoning = await self._primary_llm().invoke(prompt)
+                binary_prediction = await structure_output(
                     reasoning,
                     BinaryPrediction,
                     model=self.get_llm("parser", "llm"),
-                    num_validation_samples=self._structure_output_validation_samples,
+                    num_validation_samples=1,
                 )
                 p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-                probabilities.append(p)
-                reasonings.append(f"### [{llm.model}]\n{reasoning}")
-            except Exception as e:
-                logger.warning(
-                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
-                )
+                return ReasonedPrediction(prediction_value=p, reasoning=reasoning)
 
-        if not probabilities:
-            raise RuntimeError(
-                f"All ensemble models failed for {question.page_url}"
+            # Aggregate: arithmetic mean across successful models.
+            final_prob = max(0.01, min(0.99, statistics.mean(probabilities)))
+            logger.info(
+                f"Ensemble binary [{question.page_url}]: "
+                f"{[f'{p:.3f}' for p in probabilities]} → {final_prob:.3f}"
             )
-
-        # Arithmetic mean across models. Geometric mean of log-odds is theoretically
-        # superior but adds complexity without decisive empirical benefit at this scale.
-        final_prob = max(0.01, min(0.99, statistics.mean(probabilities)))
-
-        logger.info(
-            f"Ensemble binary [{question.page_url}]: "
-            f"{[f'{p:.3f}' for p in probabilities]} → {final_prob:.3f}"
-        )
-        return ReasonedPrediction(
-            prediction_value=final_prob,
-            reasoning="\n\n---\n\n".join(reasonings),
-        )
+            return ReasonedPrediction(
+                prediction_value=final_prob,
+                reasoning="\n\n---\n\n".join(reasonings),
+            )
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
@@ -314,95 +329,77 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
 
-        ensemble_models = self._get_ensemble_models()
-        all_option_probs: list[dict[str, float]] = []
-        reasonings: list[str] = []
+        async with self._concurrency_limiter:
+            ensemble_models = self._get_ensemble_models()
+            all_option_probs: list[dict[str, float]] = []
+            reasonings: list[str] = []
+            last_fallback: PredictedOptionList | None = None
 
-        for llm in ensemble_models:
-            try:
-                reasoning = await llm.invoke(prompt)
-                predicted_option_list: PredictedOptionList = await structure_output(
+            for llm in ensemble_models:
+                try:
+                    reasoning = await llm.invoke(prompt)
+                    predicted_option_list: PredictedOptionList = await structure_output(
+                        text_to_structure=reasoning,
+                        output_type=PredictedOptionList,
+                        model=self.get_llm("parser", "llm"),
+                        num_validation_samples=self._structure_output_validation_samples,
+                        additional_instructions=parsing_instructions,
+                    )
+                    option_probs = {
+                        opt.option_name: opt.probability
+                        for opt in predicted_option_list.predicted_options
+                    }
+                    all_option_probs.append(option_probs)
+                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
+                    if last_fallback is None:
+                        last_fallback = predicted_option_list
+                except Exception as e:
+                    logger.warning(
+                        f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                    )
+
+            if not all_option_probs:
+                # All ensemble models failed — retry with primary alone.
+                logger.warning(
+                    f"MC ensemble fully failed for {question.page_url}; "
+                    f"retrying with primary model (allowed_tries=4)."
+                )
+                reasoning = await self._primary_llm().invoke(prompt)
+                fallback_list: PredictedOptionList = await structure_output(
                     text_to_structure=reasoning,
                     output_type=PredictedOptionList,
                     model=self.get_llm("parser", "llm"),
-                    num_validation_samples=self._structure_output_validation_samples,
+                    num_validation_samples=1,
                     additional_instructions=parsing_instructions,
                 )
-                # PredictedOptionList internals vary across forecasting-tools versions;
-                # try multiple attribute naming conventions before giving up.
-                option_probs: dict[str, float] = {}
-                _items = (
-                    getattr(predicted_option_list, "predicted_options", None)
-                    or getattr(predicted_option_list, "options", None)
-                    or getattr(predicted_option_list, "prediction", None)
-                )
-                if _items is None:
-                    try:
-                        _items = list(predicted_option_list)
-                    except TypeError:
-                        _items = []
-                for _item in (_items or []):
-                    _name = (
-                        getattr(_item, "option_name", None)
-                        or getattr(_item, "option", None)
-                        or getattr(_item, "name", None)
-                    )
-                    _prob = getattr(_item, "probability", None)
-                    if _name and _prob is not None:
-                        option_probs[_name] = float(_prob)
-                if not option_probs:
-                    raise AttributeError(
-                        f"Could not extract options from {type(predicted_option_list)}"
-                    )
-                all_option_probs.append(option_probs)
-                reasonings.append(f"### [{llm.model}]\n{reasoning}")
-            except Exception as e:
-                logger.warning(
-                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
-                )
+                return ReasonedPrediction(prediction_value=fallback_list, reasoning=reasoning)
 
-        if not all_option_probs:
-            # Fallback: single-model original path (avoids dropping MC questions entirely).
-            logger.warning(
-                f"MC ensemble fully failed for {question.page_url}; "
-                f"using single-model fallback (check PredictedOptionList attributes)"
+            # Average each option's probability across all models, then renormalize.
+            avg_probs: dict[str, float] = {}
+            for option in question.options:
+                values = [d.get(option, 0.0) for d in all_option_probs]
+                avg_probs[option] = statistics.mean(values)
+
+            total = sum(avg_probs.values()) or 1.0
+            normalized = {k: v / total for k, v in avg_probs.items()}
+
+            # Re-parse the averaged probabilities into the required type.
+            averaged_text = "\n".join(
+                f"{opt}: {prob:.4f}" for opt, prob in normalized.items()
             )
-            reasoning = await self.get_llm("default", "llm").invoke(prompt)
-            fallback_list: PredictedOptionList = await structure_output(
-                text_to_structure=reasoning,
+            final_option_list: PredictedOptionList = await structure_output(
+                text_to_structure=averaged_text,
                 output_type=PredictedOptionList,
                 model=self.get_llm("parser", "llm"),
-                num_validation_samples=self._structure_output_validation_samples,
+                num_validation_samples=1,
                 additional_instructions=parsing_instructions,
             )
-            return ReasonedPrediction(prediction_value=fallback_list, reasoning=reasoning)
 
-        # Average each option's probability across all models, then renormalize.
-        avg_probs: dict[str, float] = {}
-        for option in question.options:
-            values = [d.get(option, 0.0) for d in all_option_probs]
-            avg_probs[option] = statistics.mean(values)
-
-        total = sum(avg_probs.values()) or 1.0
-        normalized = {k: v / total for k, v in avg_probs.items()}
-
-        # Re-parse the averaged probabilities into the required PredictedOptionList type.
-        averaged_text = "\n".join(
-            f"{opt}: {prob:.4f}" for opt, prob in normalized.items()
-        )
-        final_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=averaged_text,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=1,
-            additional_instructions=parsing_instructions,
-        )
-
-        logger.info(f"Ensemble MC [{question.page_url}]: {normalized}")
-        return ReasonedPrediction(
-            prediction_value=final_option_list,
-            reasoning="\n\n---\n\n".join(reasonings),
-        )
+            logger.info(f"Ensemble MC [{question.page_url}]: {normalized}")
+            return ReasonedPrediction(
+                prediction_value=final_option_list,
+                reasoning="\n\n---\n\n".join(reasonings),
+            )
 
     ##################################### NUMERIC QUESTIONS #####################################
 
@@ -484,53 +481,66 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
 
-        ensemble_models = self._get_ensemble_models()
-        all_percentile_lists: list[list[Percentile]] = []
-        reasonings: list[str] = []
+        async with self._concurrency_limiter:
+            ensemble_models = self._get_ensemble_models()
+            all_percentile_lists: list[list[Percentile]] = []
+            reasonings: list[str] = []
 
-        for llm in ensemble_models:
-            try:
-                reasoning = await llm.invoke(prompt)
-                percentile_list: list[Percentile] = await structure_output(
+            for llm in ensemble_models:
+                try:
+                    reasoning = await llm.invoke(prompt)
+                    percentile_list: list[Percentile] = await structure_output(
+                        reasoning,
+                        list[Percentile],
+                        model=self.get_llm("parser", "llm"),
+                        additional_instructions=parsing_instructions,
+                        num_validation_samples=self._structure_output_validation_samples,
+                    )
+                    if percentile_list:
+                        all_percentile_lists.append(percentile_list)
+                        reasonings.append(f"### [{llm.model}]\n{reasoning}")
+                except Exception as e:
+                    logger.warning(
+                        f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                    )
+
+            if not all_percentile_lists:
+                # All ensemble models failed — retry with primary alone.
+                logger.warning(
+                    f"All ensemble models failed for {question.page_url}; "
+                    f"retrying with primary model (allowed_tries=4)."
+                )
+                reasoning = await self._primary_llm().invoke(prompt)
+                percentile_list = await structure_output(
                     reasoning,
                     list[Percentile],
                     model=self.get_llm("parser", "llm"),
                     additional_instructions=parsing_instructions,
-                    num_validation_samples=self._structure_output_validation_samples,
+                    num_validation_samples=1,
                 )
-                if percentile_list:
-                    all_percentile_lists.append(percentile_list)
-                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
-            except Exception as e:
-                logger.warning(
-                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
-                )
+                prediction = NumericDistribution.from_question(percentile_list, question)
+                return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-        if not all_percentile_lists:
-            raise RuntimeError(
-                f"All ensemble models failed for {question.page_url}"
+            # Average percentile values across models, matching on percentile number.
+            percentile_buckets: dict[float, list[float]] = {}
+            for plist in all_percentile_lists:
+                for p in plist:
+                    percentile_buckets.setdefault(p.percentile, []).append(p.value)
+
+            averaged_percentiles = [
+                Percentile(percentile=pct, value=statistics.mean(vals))
+                for pct, vals in sorted(percentile_buckets.items())
+            ]
+
+            prediction = NumericDistribution.from_question(averaged_percentiles, question)
+            logger.info(
+                f"Ensemble numeric [{question.page_url}]: "
+                f"{[(p.percentile, round(p.value, 3)) for p in averaged_percentiles]}"
             )
-
-        # Average percentile values across models, matching on percentile number.
-        percentile_buckets: dict[float, list[float]] = {}
-        for plist in all_percentile_lists:
-            for p in plist:
-                percentile_buckets.setdefault(p.percentile, []).append(p.value)
-
-        averaged_percentiles = [
-            Percentile(percentile=pct, value=statistics.mean(vals))
-            for pct, vals in sorted(percentile_buckets.items())
-        ]
-
-        prediction = NumericDistribution.from_question(averaged_percentiles, question)
-        logger.info(
-            f"Ensemble numeric [{question.page_url}]: "
-            f"{[(p.percentile, round(p.value, 3)) for p in averaged_percentiles]}"
-        )
-        return ReasonedPrediction(
-            prediction_value=prediction,
-            reasoning="\n\n---\n\n".join(reasonings),
-        )
+            return ReasonedPrediction(
+                prediction_value=prediction,
+                reasoning="\n\n---\n\n".join(reasonings),
+            )
 
     ##################################### DATE QUESTIONS #####################################
 
@@ -607,61 +617,78 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
 
-        ensemble_models = self._get_ensemble_models()
-        all_percentile_lists: list[list[Percentile]] = []
-        reasonings: list[str] = []
+        async with self._concurrency_limiter:
+            ensemble_models = self._get_ensemble_models()
+            all_percentile_lists: list[list[Percentile]] = []
+            reasonings: list[str] = []
 
-        for llm in ensemble_models:
-            try:
-                reasoning = await llm.invoke(prompt)
-                date_percentile_list: list[DatePercentile] = await structure_output(
+            for llm in ensemble_models:
+                try:
+                    reasoning = await llm.invoke(prompt)
+                    date_percentile_list: list[DatePercentile] = await structure_output(
+                        reasoning,
+                        list[DatePercentile],
+                        model=self.get_llm("parser", "llm"),
+                        additional_instructions=parsing_instructions,
+                        num_validation_samples=self._structure_output_validation_samples,
+                    )
+                    if date_percentile_list:
+                        # Convert datetime → Unix timestamp for numeric averaging.
+                        as_timestamps = [
+                            Percentile(
+                                percentile=dp.percentile,
+                                value=dp.value.timestamp(),
+                            )
+                            for dp in date_percentile_list
+                        ]
+                        all_percentile_lists.append(as_timestamps)
+                        reasonings.append(f"### [{llm.model}]\n{reasoning}")
+                except Exception as e:
+                    logger.warning(
+                        f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
+                    )
+
+            if not all_percentile_lists:
+                # All ensemble models failed — retry with primary alone.
+                logger.warning(
+                    f"All ensemble models failed for {question.page_url}; "
+                    f"retrying with primary model (allowed_tries=4)."
+                )
+                reasoning = await self._primary_llm().invoke(prompt)
+                date_percentile_list = await structure_output(
                     reasoning,
                     list[DatePercentile],
                     model=self.get_llm("parser", "llm"),
                     additional_instructions=parsing_instructions,
-                    num_validation_samples=self._structure_output_validation_samples,
+                    num_validation_samples=1,
                 )
-                if date_percentile_list:
-                    # Convert datetime → Unix timestamp for numeric averaging.
-                    as_timestamps = [
-                        Percentile(
-                            percentile=dp.percentile,
-                            value=dp.value.timestamp(),
-                        )
-                        for dp in date_percentile_list
-                    ]
-                    all_percentile_lists.append(as_timestamps)
-                    reasonings.append(f"### [{llm.model}]\n{reasoning}")
-            except Exception as e:
-                logger.warning(
-                    f"Ensemble model {llm.model} failed on {question.page_url}: {e}"
-                )
+                percentile_list = [
+                    Percentile(percentile=dp.percentile, value=dp.value.timestamp())
+                    for dp in date_percentile_list
+                ]
+                prediction = NumericDistribution.from_question(percentile_list, question)
+                return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-        if not all_percentile_lists:
-            raise RuntimeError(
-                f"All ensemble models failed for {question.page_url}"
+            # Average timestamp values per percentile bucket.
+            percentile_buckets: dict[float, list[float]] = {}
+            for plist in all_percentile_lists:
+                for p in plist:
+                    percentile_buckets.setdefault(p.percentile, []).append(p.value)
+
+            averaged_percentiles = [
+                Percentile(percentile=pct, value=statistics.mean(vals))
+                for pct, vals in sorted(percentile_buckets.items())
+            ]
+
+            prediction = NumericDistribution.from_question(averaged_percentiles, question)
+            logger.info(
+                f"Ensemble date [{question.page_url}]: "
+                f"{[(p.percentile, p.value) for p in averaged_percentiles]}"
             )
-
-        # Average timestamp values per percentile bucket.
-        percentile_buckets: dict[float, list[float]] = {}
-        for plist in all_percentile_lists:
-            for p in plist:
-                percentile_buckets.setdefault(p.percentile, []).append(p.value)
-
-        averaged_percentiles = [
-            Percentile(percentile=pct, value=statistics.mean(vals))
-            for pct, vals in sorted(percentile_buckets.items())
-        ]
-
-        prediction = NumericDistribution.from_question(averaged_percentiles, question)
-        logger.info(
-            f"Ensemble date [{question.page_url}]: "
-            f"{[(p.percentile, p.value) for p in averaged_percentiles]}"
-        )
-        return ReasonedPrediction(
-            prediction_value=prediction,
-            reasoning="\n\n---\n\n".join(reasonings),
-        )
+            return ReasonedPrediction(
+                prediction_value=prediction,
+                reasoning="\n\n---\n\n".join(reasonings),
+            )
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -784,6 +811,32 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
 
+    def log_report_summary(self, forecast_reports: list) -> None:
+        """Override SDK default: only raise if ALL forecasts failed.
+        Partial failure (e.g., transient rate limits on some questions) is
+        acceptable for a cron bot — log errors, keep exit code 0 when any
+        question succeeded so GitHub Actions doesn't mark the run as broken."""
+        from forecasting_tools import ForecastReport
+
+        valid = [r for r in forecast_reports if isinstance(r, ForecastReport)]
+        errors = [r for r in forecast_reports if isinstance(r, BaseException)]
+
+        if errors:
+            for err in errors:
+                logger.error(f"Forecast failed: {err}")
+            logger.warning(
+                f"{len(errors)}/{len(forecast_reports)} questions failed "
+                f"(partial run — see errors above)."
+            )
+        if valid:
+            logger.info(
+                f"Successfully forecasted {len(valid)}/{len(forecast_reports)} questions."
+            )
+        if not valid:
+            raise RuntimeError(
+                f"All {len(forecast_reports)} forecasts failed — check logs."
+            )
+
     def _get_conditional_disclaimer_if_necessary(
         self, question: MetaculusQuestion
     ) -> str:
@@ -819,18 +872,19 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Ensemble and research are handled by overridden methods in the class.
-    # The llms= dict here only configures the parser and summarizer roles,
-    # which are NOT overridden and run on the lighter 8b model to keep
-    # llama-3.3-70b TPM free for actual forecasting.
+    # The llms= dict here only configures parser and summarizer — both run on
+    # llama-3.1-8b-instant (light tasks, preserves 70b TPM for forecasting).
+    # Forecasting is fully serialised via _concurrency_limiter so TPM limits
+    # are never hit even when many questions are in flight.
     #
-    # Ensemble models (selected dynamically in _get_ensemble_models):
+    # Ensemble models (from _get_ensemble_models, based on env vars):
     #   GROQ_API_KEY (required): llama-3.3-70b-versatile + llama-3.1-8b-instant
     #   ANTHROPIC_API_KEY (optional): adds claude-haiku-4-5-20251001
     #
     # Research strategy (first available wins):
     #   ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → AskNews real-time news
     #   EXA_API_KEY or PERPLEXITY_API_KEY  → SmartSearcher web search
-    #   (neither set)                       → Groq LLM knowledge only
+    #   (neither set)                       → Groq 70b LLM knowledge only
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -847,22 +901,22 @@ if __name__ == "__main__":
                 timeout=60,
                 allowed_tries=2,
             ),
-            # parser and summarizer use the 8b model: parsing/summarizing don't
-            # need the 70b and using 8b preserves the 70b's 12k TPM for forecasting.
+            # parser and summarizer use the 8b model (parsing/summarising don't
+            # need the 70b and using 8b preserves the 70b's 12k TPM).
             "summarizer": GeneralLlm(
                 model="groq/llama-3.1-8b-instant",
                 temperature=0.3,
                 timeout=60,
-                allowed_tries=2,
+                allowed_tries=3,
             ),
             "parser": GeneralLlm(
                 model="groq/llama-3.1-8b-instant",
                 temperature=0.3,
                 timeout=60,
-                allowed_tries=2,
+                allowed_tries=3,
             ),
             "researcher": GeneralLlm(
-                model="groq/llama-3.1-8b-instant",
+                model="groq/llama-3.3-70b-versatile",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
