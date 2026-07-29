@@ -49,25 +49,25 @@ logger = logging.getLogger(__name__)
 
 class SummerTemplateBot2026(ForecastBot):
     """
-    Ensemble bot for Summer 2026 Metaculus AI Tournament.
+    Ensemble-ready bot for Summer 2026 Metaculus AI Tournament.
 
-    Improvements over the single-model template:
-    - Multi-model ensemble: runs Groq llama-3.3-70b-versatile + Groq
-      llama-3.1-8b-instant. Each model's predictions are aggregated (arithmetic
-      mean for binary, percentile averaging for numeric/date, probability
-      averaging for multiple-choice). A model that errors is skipped; if ALL
-      models fail, the primary is retried alone with higher allowed_tries.
-    - Adaptive researcher: uses AskNews (real-time news) when ASKNEWS_CLIENT_ID +
-      ASKNEWS_SECRET are set, SmartSearcher (web) when EXA_API_KEY or
-      PERPLEXITY_API_KEY are set, and falls back to Groq LLM knowledge otherwise.
-    - Concurrency control: _concurrency_limiter applied to both research AND each
-      forecast method, fully serialising question processing to stay within free-tier
-      TPM limits on both Groq models.
+    TPM-aware design (Groq free tier limits: 70b=12k, 8b=6k):
+    - Forecast ensemble: llama-3.3-70b only by default (~2k TPM/question on 70b).
+      Adds Claude Haiku when ANTHROPIC_API_KEY is set (separate TPM pool → true
+      multi-model ensemble with no Groq budget competition).
+    - Research: AskNews → SmartSearcher → 8b LLM fallback. The 8b is used here
+      (not 70b) so the 70b budget is preserved for forecasting.
+    - Parsing: 8b model. Combined 8b usage (research fallback + parsing) stays
+      under ~2k TPM/question, well within the 6k limit.
+    - All questions are processed sequentially (_max_concurrent_questions=1) to
+      avoid bursty parallel usage that would trip per-minute rate limits.
+    - Partial failures (rate limit on some questions) are tolerated; only a total
+      wipeout (0 forecasts) raises RuntimeError and fails the workflow.
 
-    Pending credentials (add as GitHub Secrets to unlock further improvements):
-    - ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → real-time news research
-      Signup: https://my.asknews.app (Free Tier)
-    - ANTHROPIC_API_KEY → adds Claude Haiku 4.5 to ensemble (best reasoning)
+    Pending credentials (add as GitHub Secrets to unlock improvements):
+    - ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → real-time news research (Free Tier)
+      Signup: https://my.asknews.app
+    - ANTHROPIC_API_KEY → activates 2-model ensemble (70b + Haiku)
     - EXA_API_KEY or PERPLEXITY_API_KEY → enables SmartSearcher web research
     """
 
@@ -85,19 +85,22 @@ class SummerTemplateBot2026(ForecastBot):
     _ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
 
     def _get_ensemble_models(self) -> list[GeneralLlm]:
-        """Return list of LLMs for ensemble based on available env vars."""
+        """Return LLMs for ensemble based on available credentials.
+
+        Free tier (Groq only): single llama-3.3-70b model. This uses at most
+        ~2k TPM/question, safely within the 12k free-tier limit even for a
+        batch of test questions. The 8b model is reserved for research fallback
+        and parsing — adding it here would exhaust its 6k TPM limit immediately.
+
+        With ANTHROPIC_API_KEY: adds Claude Haiku (separate TPM pool → true
+        2-model ensemble with no Groq competition).
+        """
         models: list[GeneralLlm] = [
             GeneralLlm(
                 model=self._GROQ_PRIMARY,
                 temperature=0.3,
                 timeout=60,
-                allowed_tries=2,
-            ),
-            GeneralLlm(
-                model=self._GROQ_SECONDARY,
-                temperature=0.3,
-                timeout=60,
-                allowed_tries=2,
+                allowed_tries=3,
             ),
         ]
         if os.getenv("ANTHROPIC_API_KEY"):
@@ -168,8 +171,12 @@ class SummerTemplateBot2026(ForecastBot):
                 except Exception as e:
                     logger.warning(f"SmartSearcher failed, falling through: {e}")
 
-            # Fallback: Groq LLM knowledge only (no live web access).
-            research = await self._primary_llm().invoke(prompt)
+            # Fallback: LLM knowledge only. Use 8b to preserve 70b TPM for
+            # forecasting — research quality difference is acceptable here.
+            researcher_llm = GeneralLlm(
+                model=self._GROQ_SECONDARY, temperature=0.3, timeout=60, allowed_tries=2
+            )
+            research = await researcher_llm.invoke(prompt)
             logger.info(f"LLM-only research for {question.page_url}: done")
             return research
 
@@ -871,20 +878,18 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Ensemble and research are handled by overridden methods in the class.
-    # The llms= dict here only configures parser and summarizer — both run on
-    # llama-3.1-8b-instant (light tasks, preserves 70b TPM for forecasting).
-    # Forecasting is fully serialised via _concurrency_limiter so TPM limits
-    # are never hit even when many questions are in flight.
+    # llms= configures parser and summarizer only — forecasting and research are
+    # handled by the overridden methods above. Both use the 8b model (light tasks)
+    # so the 70b's 12k TPM is fully available for forecasting.
     #
-    # Ensemble models (from _get_ensemble_models, based on env vars):
-    #   GROQ_API_KEY (required): llama-3.3-70b-versatile + llama-3.1-8b-instant
-    #   ANTHROPIC_API_KEY (optional): adds claude-haiku-4-5-20251001
+    # Ensemble (from _get_ensemble_models):
+    #   GROQ only → single llama-3.3-70b-versatile (~2k TPM/question)
+    #   + ANTHROPIC_API_KEY → adds claude-haiku-4-5 (true 2-model ensemble)
     #
-    # Research strategy (first available wins):
+    # Research (first available wins):
     #   ASKNEWS_CLIENT_ID + ASKNEWS_SECRET → AskNews real-time news
     #   EXA_API_KEY or PERPLEXITY_API_KEY  → SmartSearcher web search
-    #   (neither set)                       → Groq 70b LLM knowledge only
+    #   (fallback)                          → llama-3.1-8b-instant LLM knowledge
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=1,
